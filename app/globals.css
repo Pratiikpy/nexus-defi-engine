@@ -1,0 +1,34 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --nexus-primary: #14F195;
+  --nexus-secondary: #9945FF;
+  --nexus-dark: #0F0F0F;
+  --nexus-card: #1A1A1A;
+}
+
+body {
+  background: linear-gradient(135deg, #0F0F0F 0%, #1A1A2E 100%);
+  min-height: 100vh;
+}
+
+@layer utilities {
+  .gradient-primary {
+    background: linear-gradient(135deg, #14F195 0%, #9945FF 100%);
+  }
+  
+  .gradient-card {
+    background: linear-gradient(135deg, rgba(20, 241, 149, 0.1) 0%, rgba(153, 69, 255, 0.1) 100%);
+    border: 1px solid rgba(20, 241, 149, 0.2);
+  }
+  
+  .glow-primary {
+    box-shadow: 0 0 20px rgba(20, 241, 149, 0.3);
+  }
+  
+  .glow-secondary {
+    box-shadow: 0 0 20px rgba(153, 69, 255, 0.3);
+  }
+}
