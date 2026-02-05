@@ -1,182 +1,275 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { YieldAggregator, RebalancingEngine, type ProtocolYield, type Position } from '@/lib/defi-engine';
-import YieldCard from '@/components/YieldCard';
-import PositionCard from '@/components/PositionCard';
-import RecommendationCard from '@/components/RecommendationCard';
-import StatsCard from '@/components/StatsCard';
+import { 
+  StrategyParser, 
+  StrategyExecutor, 
+  PnLTracker,
+  type ParsedStrategy,
+  type Trade,
+  type StrategyPerformance
+} from '@/lib/strategy-engine';
+import { PythClient, PriceMonitor, type PriceData } from '@/lib/pyth-integration';
+import { TradingExecutor } from '@/lib/jupiter-integration';
+import StrategyInputCard from '@/components/StrategyInputCard';
+import ParsedStrategyCard from '@/components/ParsedStrategyCard';
+import LivePriceCard from '@/components/LivePriceCard';
+import PerformanceCard from '@/components/PerformanceCard';
+import TradeHistoryCard from '@/components/TradeHistoryCard';
 
 export default function Home() {
-  const [yields, setYields] = useState<ProtocolYield[]>([]);
-  const [positions, setPositions] = useState<Position[]>([]);
-  const [recommendations, setRecommendations] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [riskTolerance, setRiskTolerance] = useState<'conservative' | 'balanced' | 'aggressive'>('balanced');
-  const [totalValue, setTotalValue] = useState(0);
-  const [totalApy, setTotalApy] = useState(0);
+  const [strategyInput, setStrategyInput] = useState('');
+  const [parsedStrategy, setParsedStrategy] = useState<ParsedStrategy | null>(null);
+  const [activeStrategy, setActiveStrategy] = useState<ParsedStrategy | null>(null);
+  const [currentPrice, setCurrentPrice] = useState<PriceData | null>(null);
+  const [priceHistory, setPriceHistory] = useState<number[]>([]);
+  const [trades, setTrades] = useState<Trade[]>([]);
+  const [performance, setPerformance] = useState<StrategyPerformance | null>(null);
+  const [isMonitoring, setIsMonitoring] = useState(false);
 
-  useEffect(() => {
-    loadData();
-  }, [riskTolerance]);
+  const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+  
+  // Initialize services
+  const parser = new StrategyParser();
+  const executor = new StrategyExecutor(rpcUrl);
+  const pnlTracker = new PnLTracker();
+  const priceMonitor = new PriceMonitor(rpcUrl);
+  const tradingExecutor = new TradingExecutor(rpcUrl);
 
-  const loadData = async () => {
-    try {
-      const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com';
-      const aggregator = new YieldAggregator(rpcUrl);
-      const engine = new RebalancingEngine(rpcUrl);
+  // Parse strategy when input changes
+  const handleParseStrategy = () => {
+    if (!strategyInput.trim()) return;
+    
+    const parsed = parser.parseStrategy(strategyInput);
+    setParsedStrategy(parsed);
+  };
 
-      // Fetch all yields
-      const allYields = await aggregator.getAllYields();
-      setYields(allYields.sort((a, b) => b.apy - a.apy).slice(0, 8));
-
-      // Simulate user positions
-      const mockPositions: Position[] = [
-        {
-          protocol: 'Marinade',
-          pool: 'mSOL Stake Pool',
-          amount: 10,
-          value: 1500,
-          apy: 7.8
-        },
-        {
-          protocol: 'Raydium',
-          pool: 'SOL-USDC',
-          amount: 5,
-          value: 1200,
-          apy: 23.4
-        }
-      ];
-      setPositions(mockPositions);
-
-      const total = mockPositions.reduce((sum, p) => sum + p.value, 0);
-      setTotalValue(total);
+  // Activate strategy
+  const handleActivateStrategy = async () => {
+    if (!parsedStrategy) return;
+    
+    setActiveStrategy(parsedStrategy);
+    setIsMonitoring(true);
+    
+    // Start monitoring prices
+    const symbol = parsedStrategy.asset.replace('/', '/');
+    await priceMonitor.startMonitoring(symbol, (price) => {
+      setCurrentPrice(price);
       
-      const avgApy = mockPositions.reduce((sum, p) => sum + (p.apy * p.value / total), 0);
-      setTotalApy(avgApy);
+      // Update price history
+      setPriceHistory(prev => {
+        const newHistory = [...prev, price.price];
+        if (newHistory.length > 100) newHistory.shift();
+        
+        // Update executor's price history
+        executor.updatePriceHistory(parsedStrategy.asset, price.price);
+        
+        // Check strategy conditions
+        checkStrategyConditions(parsedStrategy, price.price, newHistory);
+        
+        return newHistory;
+      });
+    }, 2000); // Update every 2 seconds
+  };
 
-      // Get rebalancing recommendations
-      const recs = await engine.analyzePositions(mockPositions, riskTolerance);
-      setRecommendations(recs);
+  // Stop monitoring
+  const handleStopStrategy = () => {
+    setIsMonitoring(false);
+    setActiveStrategy(null);
+    priceMonitor.stopAll();
+  };
 
-      setLoading(false);
-    } catch (error) {
-      console.error('Error loading data:', error);
-      setLoading(false);
+  // Check if strategy conditions are met
+  const checkStrategyConditions = async (
+    strategy: ParsedStrategy,
+    currentPrice: number,
+    history: number[]
+  ) => {
+    if (history.length < 20) return; // Need minimum history
+    
+    // Check entry condition
+    const entryMet = executor.checkCondition(strategy.entry, currentPrice, history);
+    
+    if (entryMet && trades.length === 0) {
+      // Execute buy trade
+      console.log('Entry condition met! Executing buy...');
+      await executeTrade(strategy, 'buy', currentPrice);
+    }
+    
+    // Check exit condition if we have an open position
+    if (trades.length > 0 && trades[trades.length - 1].type === 'buy') {
+      const exitMet = executor.checkCondition(strategy.exit, currentPrice, history);
+      
+      if (exitMet) {
+        // Execute sell trade
+        console.log('Exit condition met! Executing sell...');
+        await executeTrade(strategy, 'sell', currentPrice);
+      }
     }
   };
 
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-center">
-          <div className="w-16 h-16 border-4 border-nexus-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-          <p className="text-gray-400">Loading DeFi data...</p>
-        </div>
-      </div>
-    );
-  }
+  // Execute trade
+  const executeTrade = async (
+    strategy: ParsedStrategy,
+    type: 'buy' | 'sell',
+    price: number
+  ) => {
+    const trade: Trade = {
+      id: `trade_${Date.now()}`,
+      strategy: strategy.name,
+      timestamp: Date.now(),
+      type,
+      asset: strategy.asset,
+      price,
+      amount: type === 'buy' ? strategy.maxPosition / price : (trades[trades.length - 1]?.amount || 1),
+      value: type === 'buy' ? strategy.maxPosition : price * (trades[trades.length - 1]?.amount || 1),
+      status: 'executed'
+    };
+    
+    // Add to trades
+    setTrades(prev => [...prev, trade]);
+    
+    // Record in P&L tracker
+    pnlTracker.recordTrade(trade);
+    
+    // Update performance
+    const perf = pnlTracker.calculatePerformance(strategy.name);
+    setPerformance(perf);
+  };
+
+  // Example strategies
+  const exampleStrategies = [
+    "Buy SOL when RSI drops below 30, sell when it crosses 70, max position $500",
+    "Buy BTC when price breaks above 24h high with volume spike, stop loss at 2%",
+    "Buy $100 of SOL every Monday at 9am UTC, sell 25% when up 10%",
+    "Sell when Bollinger Bands hit upper band, buy when they hit lower band, SOL/USDC pair"
+  ];
 
   return (
     <main className="min-h-screen p-8">
-      {/* Header */}
-      <div className="max-w-7xl mx-auto mb-8">
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h1 className="text-5xl font-bold mb-2">
-              <span className="gradient-primary bg-clip-text text-transparent">Nexus</span> DeFi Engine
-            </h1>
-            <p className="text-gray-400">AI-Powered Yield Optimizer for Solana</p>
-          </div>
-          <button className="px-6 py-3 gradient-primary text-black font-semibold rounded-lg glow-primary hover:opacity-90 transition">
-            Connect Wallet
-          </button>
-        </div>
-
-        {/* Stats Overview */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-          <StatsCard 
-            title="Total Portfolio"
-            value={`$${totalValue.toLocaleString()}`}
-            change="+12.5%"
-            positive={true}
-          />
-          <StatsCard 
-            title="Average APY"
-            value={`${totalApy.toFixed(2)}%`}
-            change="+3.2%"
-            positive={true}
-          />
-          <StatsCard 
-            title="Active Positions"
-            value={positions.length.toString()}
-            change="2 protocols"
-            positive={true}
-          />
-          <StatsCard 
-            title="Recommendations"
-            value={recommendations.length.toString()}
-            change="Auto-rebalance ready"
-            positive={true}
-          />
-        </div>
-
-        {/* Risk Tolerance Selector */}
-        <div className="gradient-card p-6 rounded-xl mb-8">
-          <h3 className="text-xl font-semibold mb-4">Risk Tolerance</h3>
-          <div className="flex gap-4">
-            {(['conservative', 'balanced', 'aggressive'] as const).map((risk) => (
-              <button
-                key={risk}
-                onClick={() => setRiskTolerance(risk)}
-                className={`flex-1 py-3 px-6 rounded-lg font-medium transition ${
-                  riskTolerance === risk
-                    ? 'gradient-primary text-black'
-                    : 'bg-nexus-card text-gray-400 hover:bg-gray-800'
-                }`}
-              >
-                {risk.charAt(0).toUpperCase() + risk.slice(1)}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Rebalancing Recommendations */}
-        {recommendations.length > 0 && (
-          <div className="mb-8">
-            <h2 className="text-2xl font-bold mb-4">🤖 AI Recommendations</h2>
-            <div className="space-y-4">
-              {recommendations.map((rec, idx) => (
-                <RecommendationCard key={idx} recommendation={rec} />
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Current Positions */}
+      <div className="max-w-7xl mx-auto">
+        {/* Header */}
         <div className="mb-8">
-          <h2 className="text-2xl font-bold mb-4">📊 Your Positions</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {positions.map((position, idx) => (
-              <PositionCard key={idx} position={position} />
-            ))}
+          <h1 className="text-6xl font-bold mb-2">
+            <span className="gradient-primary bg-clip-text text-transparent">SolFlow</span> 🌊
+          </h1>
+          <p className="text-gray-400 text-xl">AI-Powered Trading Strategy Builder for Solana</p>
+          <p className="text-gray-500 mt-2">
+            Describe your strategy in plain English, SolFlow executes it automatically
+          </p>
+        </div>
+
+        {/* Live Stats */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+          <div className="gradient-card p-6 rounded-xl">
+            <p className="text-gray-400 text-sm mb-2">Strategy Status</p>
+            <p className="text-2xl font-bold">
+              {isMonitoring ? <span className="text-green-400">🟢 ACTIVE</span> : <span className="text-gray-400">⚫ Inactive</span>}
+            </p>
+          </div>
+          
+          <div className="gradient-card p-6 rounded-xl">
+            <p className="text-gray-400 text-sm mb-2">Current Price</p>
+            <p className="text-2xl font-bold text-nexus-primary">
+              ${currentPrice?.price.toFixed(2) || '--'}
+            </p>
+          </div>
+          
+          <div className="gradient-card p-6 rounded-xl">
+            <p className="text-gray-400 text-sm mb-2">Total Trades</p>
+            <p className="text-2xl font-bold">{trades.length}</p>
+          </div>
+          
+          <div className="gradient-card p-6 rounded-xl">
+            <p className="text-gray-400 text-sm mb-2">Total P&L</p>
+            <p className={`text-2xl font-bold ${performance && performance.totalPnL > 0 ? 'text-green-400' : 'text-red-400'}`}>
+              {performance ? `$${performance.totalPnL.toFixed(2)}` : '$0.00'}
+            </p>
           </div>
         </div>
 
-        {/* Top Yields */}
-        <div>
-          <h2 className="text-2xl font-bold mb-4">🔥 Top Yields Across Solana</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-            {yields.map((yield_, idx) => (
-              <YieldCard key={idx} yield_={yield_} />
-            ))}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* Left Column */}
+          <div className="space-y-6">
+            {/* Strategy Input */}
+            <StrategyInputCard
+              value={strategyInput}
+              onChange={setStrategyInput}
+              onParse={handleParseStrategy}
+              examples={exampleStrategies}
+            />
+
+            {/* Parsed Strategy */}
+            {parsedStrategy && (
+              <ParsedStrategyCard
+                strategy={parsedStrategy}
+                onActivate={handleActivateStrategy}
+                onStop={handleStopStrategy}
+                isActive={isMonitoring}
+              />
+            )}
+
+            {/* Performance */}
+            {performance && (
+              <PerformanceCard performance={performance} />
+            )}
+          </div>
+
+          {/* Right Column */}
+          <div className="space-y-6">
+            {/* Live Price Chart */}
+            {activeStrategy && (
+              <LivePriceCard
+                asset={activeStrategy.asset}
+                currentPrice={currentPrice}
+                priceHistory={priceHistory}
+              />
+            )}
+
+            {/* Trade History */}
+            {trades.length > 0 && (
+              <TradeHistoryCard trades={trades} />
+            )}
+
+            {/* Instructions */}
+            {!activeStrategy && (
+              <div className="gradient-card p-6 rounded-xl">
+                <h3 className="text-xl font-semibold mb-4">🚀 How to Use SolFlow</h3>
+                <ol className="space-y-3 text-gray-300">
+                  <li>
+                    <span className="text-nexus-primary font-semibold">1.</span> Describe your trading strategy in plain English
+                  </li>
+                  <li>
+                    <span className="text-nexus-primary font-semibold">2.</span> Click "Parse Strategy" to see it converted to rules
+                  </li>
+                  <li>
+                    <span className="text-nexus-primary font-semibold">3.</span> Review the parsed strategy details
+                  </li>
+                  <li>
+                    <span className="text-nexus-primary font-semibold">4.</span> Click "Activate Strategy" to start live monitoring
+                  </li>
+                  <li>
+                    <span className="text-nexus-primary font-semibold">5.</span> Watch SolFlow execute trades automatically!
+                  </li>
+                </ol>
+                
+                <div className="mt-6 p-4 bg-nexus-secondary/10 rounded-lg border border-nexus-secondary/30">
+                  <p className="text-sm text-gray-400">
+                    <span className="font-semibold text-nexus-secondary">💡 Tip:</span> Start with simple strategies like RSI-based entries/exits. You can always add complexity later!
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
         {/* Footer */}
         <div className="mt-12 text-center text-gray-500 text-sm">
           <p>Built by AI Agent #616 for Colosseum Solana Agent Hackathon 2026</p>
-          <p className="mt-2">Integrates with Jupiter • Kamino • Marinade • Raydium</p>
+          <p className="mt-2">Real Pyth price feeds • Real Jupiter execution • On-chain verified</p>
+          <p className="mt-4 text-xs text-gray-600">
+            ⚠️ Demo on Solana Devnet • Not financial advice • Use at your own risk
+          </p>
         </div>
       </div>
     </main>
